@@ -1,4 +1,7 @@
 package Bio::GenomeMap;
+{
+  $Bio::GenomeMap::VERSION = '0.03';
+}
 # ABSTRACT: Data structure store and query genomically indexed data efficiently using SQLite's R*Tree.
 
 use strict;
@@ -24,6 +27,9 @@ has ro => (is => 'ro', default => 0);
 has dbh                    => ( is => 'rw', init_arg => undef);
 has sth_insert_rtree       => ( is => 'rw', init_arg => undef);
 has sth_insert_data        => ( is => 'rw', init_arg => undef);
+has sth_insert_sequence    => ( is => 'rw', init_arg => undef);
+has sth_select_sequence    => ( is => 'rw', init_arg => undef);
+has sth_select_seqid       => ( is => 'rw', init_arg => undef);
 has sth_select_overlap     => ( is => 'rw', init_arg => undef);
 has sth_select_surrounding => ( is => 'rw', init_arg => undef);
 has sth_select_within      => ( is => 'rw', init_arg => undef);
@@ -44,30 +50,55 @@ sub BUILD{
     $self->dbh->do(q{PRAGMA journal_mode = OFF});
     $self->dbh->do(q{PRAGMA cache_size = 80000});
 
-    $self->dbh->do(q{ create virtual table if not exists map using rtree_i32(id, start, end); });
-    $self->dbh->do(q{ create table if not exists data (id integer primary key, seq, is_storable integer, data); });
-    $self->dbh->do(q{ create index if not exists idx1 on data (id, seq)});
+    $self->dbh->do(q{ 
+        create virtual table if not exists map using rtree_i32(
+            id, 
+            seqid1, 
+            seqid2, 
+            start, 
+            end
+        ); });
+    $self->dbh->do(q{ 
+        create table if not exists data (
+            id integer primary key, 
+            is_storable integer, 
+            data
+        ); });
+    $self->dbh->do(q{ 
+        create table if not exists sequence (
+            id integer primary key, 
+            name 
+        ); });
 
     $self->sth_insert_rtree(
-        $self->dbh->prepare(q{insert into map (start, end) values (?,?)})
+        $self->dbh->prepare(q{insert into map (seqid1, seqid2, start, end) values (?,?,?,?); })
     );
     $self->sth_insert_data(
-        $self->dbh->prepare(q{insert into data (id, seq, is_storable, data) values (last_insert_rowid(),?,?,?)})
+        $self->dbh->prepare(q{insert into data (id, is_storable, data) values (last_insert_rowid(),?,?); })
+    );
+    $self->sth_insert_sequence(
+        $self->dbh->prepare(q{insert into sequence (name) values (?); })
+    );
+
+    $self->sth_select_sequence(
+        $self->dbh->prepare(q{select id from sequence where name = ?; })
+    );
+
+    $self->sth_select_seqid(
+        $self->dbh->prepare(q{select name from sequence where id = ?; })
     );
 
     $self->sth_select_overlap(
         $self->dbh->prepare(
             q{
             select map.start, map.end, data.is_storable, data.data
-            from data, map 
-            where 
-            data.id = map.id
-                and
-            data.seq = ?
-                and
-            ? <= map.end and map.start <= ?
-            order by data.seq, map.start
-            ;
+            from data, map where 
+            (data.id = map.id) 
+                and 
+            (? <= map.end and map.start <= ?)
+                and 
+            (map.seqid1 = ?) 
+            order by map.start;
             }
         )
     );
@@ -76,15 +107,13 @@ sub BUILD{
         $self->dbh->prepare(
             q{
             select map.start, map.end, data.is_storable, data.data
-            from data, map 
-            where 
-            data.id = map.id
-                and
-            data.seq = ?
-                and
-            ? <= map.start and map.end <= ?
-            order by data.seq, map.start
-            ;
+            from data, map where 
+            (data.id = map.id) 
+                and 
+            (? <= map.start and map.end <= ?)
+                and 
+            (map.seqid1 = ?) 
+            order by map.start;
             }
         )
     );
@@ -93,15 +122,13 @@ sub BUILD{
         $self->dbh->prepare(
             q{
             select map.start, map.end, data.is_storable, data.data
-            from data, map 
-            where 
-            data.id = map.id
-                and
-            data.seq = ?
-                and
-            map.start <= ? and ? <= map.end 
-            order by data.seq, map.start
-            ;
+            from data, map where 
+            (data.id = map.id) 
+                and 
+            (map.start <= ? and ? <= map.end)
+                and 
+            (map.seqid1 = ?) 
+            order by map.start;
             }
         )
     );
@@ -109,11 +136,11 @@ sub BUILD{
     $self->sth_select_all(
         $self->dbh->prepare(
             q{
-            select data.seq, map.start, map.end, data.is_storable, data.data
-            from data, map 
+            select map.seqid1, map.start, map.end, data.is_storable, data.data
+            from data, map
             where 
-            data.id = map.id
-            order by data.seq, map.start
+            data.id = map.id 
+            order by map.seqid1, map.start
             ;
             }
         )
@@ -122,13 +149,13 @@ sub BUILD{
     $self->sth_search_data(
         $self->dbh->prepare(
             q{
-            select data.seq, map.start, map.end, data.is_storable, data.data
-            from data, map 
+            select map.seqid1, map.start, map.end, data.is_storable, data.data
+            from data, map
             where 
             data.data like ?
                 and
-            data.id = map.id
-            order by data.seq, map.start
+            data.id = map.id 
+            order by map.seqid1, map.start
             ;
             }
         )
@@ -144,6 +171,76 @@ sub DEMOLISH{
     }
 }
 
+
+# seqid cache so that we don't have to get the sequence from db every single
+# insert.  we also use cache to get id for SELECTION as well-- I couldn't
+# figure out how to make the select statements to do 3 table joins using all
+# indices... (I think the problem is that I'm using a dimension of the rtree as
+# a foreign key (seqid1 and seqid2), 
+
+has seqidcache => (
+    traits    => ['Hash'],
+    is        => 'ro',
+    isa       => 'HashRef[Str]',
+    default   => sub { {} },
+    handles   => {
+        set_seqidcache     => 'set',
+        get_seqidcache     => 'get',
+        has_seqidcache     => 'exists',
+    },
+);
+sub seqname_to_seqid{
+    my ($self, $seqname) = @_;
+    if ($self->has_seqidcache($seqname)){
+        return $self->get_seqidcache($seqname);
+    }
+    else{
+        my $select = $self->sth_select_sequence();
+        $select->execute($seqname);
+        if (my $row = $select->fetchrow_arrayref) {
+            $self->set_seqidcache($seqname, $row->[0]);
+            return $row->[0];
+        }
+        else{
+            my $insert = $self->sth_insert_sequence();
+            $insert->execute($seqname);
+            my $row = $self->dbh->selectrow_arrayref('select last_insert_rowid();') or croak "couldn't get sequence insert last rowid";
+            $self->set_seqidcache($seqname, $row->[0]);
+            return $row->[0];
+        }
+    }
+}
+
+has seqnamecache => (
+    traits    => ['Hash'],
+    is        => 'ro',
+    isa       => 'HashRef[Str]',
+    default   => sub { {} },
+    handles   => {
+        set_seqnamecache     => 'set',
+        get_seqnamecache     => 'get',
+        has_seqnamecache     => 'exists',
+    },
+);
+sub seqid_to_seqname{
+    my ($self, $seqid) = @_;
+    if ($self->has_seqnamecache($seqid)){
+        return $self->get_seqnamecache($seqid);
+    }
+    else{
+        my $select = $self->sth_select_seqid();
+        $select->execute($seqid);
+        if (my $row = $select->fetchrow_arrayref) {
+            $self->set_seqnamecache($seqid, $row->[0]);
+            return $row->[0];
+        }
+        else{
+            croak "no such seqid $seqid";
+        }
+    }
+
+}
+
 sub bulk_insert{
     my ($self, $sub) = @_;
     my $dbh              = $self->dbh;
@@ -152,13 +249,15 @@ sub bulk_insert{
 
     my $counter = 1;
     my $inserter = sub{
-        my ($seqid, $start, $end, $data) = @_;
-        $sth_insert_rtree->execute($start, $end);
+        my ($seqname, $start, $end, $data) = @_;
+        my $seqid = $self->seqname_to_seqid($seqname);
+
+        $sth_insert_rtree->execute($seqid, $seqid, $start, $end);
         if (ref $data eq ''){
-            $sth_insert_data->execute($seqid, 0, $data);
+            $sth_insert_data->execute(0, $data);
         }
         else{
-            $sth_insert_data->execute($seqid, 1, freeze($data));
+            $sth_insert_data->execute(1, freeze($data));
         }
 
         if (++$counter % 50_000 == 0){
@@ -172,13 +271,14 @@ sub bulk_insert{
 # this is a higher level insert function.  Commits every time so not efficient.
 # use bulk_insert() instead.
 sub insert{
-    my ($self, $seqid, $start, $end, $data) = @_;
-    $self->sth_insert_rtree->execute($start, $end);
+    my ($self, $seqname, $start, $end, $data) = @_;
+    my $seqid = $self->seqname_to_seqid($seqname);
+    $self->sth_insert_rtree->execute($seqid, $seqid, $start, $end);
     if (ref $data eq ''){
-        $self->sth_insert_data->execute($seqid, 0, $data);
+        $self->sth_insert_data->execute(0, $data);
     }
     else{
-        $self->sth_insert_data->execute($seqid, 1, freeze($data));
+        $self->sth_insert_data->execute(1, freeze($data));
     }
     $self->dbh->commit;
 }
@@ -193,7 +293,7 @@ sub commit{
 sub _select_iter{
     my ($sth, $seqid, $start, $end, $code) = @_;
 
-    $sth->execute($seqid, $start, $end);
+    $sth->execute( $start, $end, $seqid);
     while (my $row = $sth->fetchrow_arrayref) {
         my ($s, $e, $is_storable, $data) = @$row;
         if ($is_storable){
@@ -205,16 +305,19 @@ sub _select_iter{
     }
 }
 sub iter_overlaps{
-    my ($self, $seqid, $start, $end, $code) = @_;
+    my ($self, $seqname, $start, $end, $code) = @_;
+    my $seqid = $self->seqname_to_seqid($seqname);
     _select_iter($self->sth_select_overlap, $seqid, $start, $end, $code);
 }
 
 sub iter_surrounding{
-    my ($self, $seqid, $start, $end, $code) = @_;
+    my ($self, $seqname, $start, $end, $code) = @_;
+    my $seqid = $self->seqname_to_seqid($seqname);
     _select_iter($self->sth_select_surrounding, $seqid, $start, $end, $code);
 }
 sub iter_within{
-    my ($self, $seqid, $start, $end, $code) = @_;
+    my ($self, $seqname, $start, $end, $code) = @_;
+    my $seqid = $self->seqname_to_seqid($seqname);
     _select_iter($self->sth_select_within, $seqid, $start, $end, $code);
 }
 
@@ -224,12 +327,13 @@ sub iter_all{
     $sth->execute();
 
     while (my $row = $sth->fetchrow_arrayref) {
-        my ($seq, $s, $e, $is_storable, $data) = @$row;
+        my ($seqid, $s, $e, $is_storable, $data) = @$row;
+        my $seqname = $self->seqid_to_seqname($seqid);
         if ($is_storable){
-            $code->($seq, $s, $e, thaw($data));
+            $code->($seqname, $s, $e, thaw($data));
         }
         else{
-            $code->($seq, $s, $e, $data);
+            $code->($seqname, $s, $e, $data);
         }
     }
 }
@@ -247,22 +351,25 @@ sub _slurp{
 }
 
 sub slurp_overlaps{
-    my ($self, $seqid, $start, $end) = @_;
+    my ($self, $seqname, $start, $end) = @_;
+    my $seqid = $self->seqname_to_seqid($seqname);
     _slurp($self->sth_select_overlap, $seqid, $start, $end);
 }
 
 sub slurp_surrounding{
-    my ($self, $seqid, $start, $end) = @_;
+    my ($self, $seqname, $start, $end) = @_;
+    my $seqid = $self->seqname_to_seqid($seqname);
     _slurp($self->sth_select_surrounding, $seqid, $start, $end);
 }
 
 sub slurp_within{
-    my ($self, $seqid, $start, $end) = @_;
+    my ($self, $seqname, $start, $end) = @_;
+    my $seqid = $self->seqname_to_seqid($seqname);
     _slurp($self->sth_select_within, $seqid, $start, $end);
 }
 
 sub slurp_all{
-    my ($self, $seqid, $start, $end) = @_;
+    my ($self) = @_;
     my @accum;
     $self->iter_all(sub{
             my ($seq, $start, $end, $data) = @_;
@@ -276,13 +383,13 @@ sub sequences{
     my $dbh = $self->dbh;
 
     my $select_sth = $dbh->prepare(q{
-        select distinct(seq) from data order by seq asc;
+        select name from sequence order by name asc;
         });
     $select_sth->execute();
 
     my @accum;
     while (my $row = $select_sth->fetchrow_hashref) {
-        push @accum, $row->{seq};
+        push @accum, $row->{name};
     }
     return @accum;
 }
@@ -297,9 +404,12 @@ sub search{
     my $counter = 0;
     my $end = $start + $limit - 1;
 
-    while (my $row = $sth->fetchrow_hashref) {
+    # select map.seqid1, map.start, map.end, data.is_storable, data.data
+    while (my $row = $sth->fetchrow_arrayref) {
+        my ($seqid, $s, $e, $sto, $data) = @$row;
+        my $seqname = $self->seqid_to_seqname($seqid);
         if ($start <= $counter && $counter <= $end){
-            push @accum, [$row->{seq}, $row->{start}, $row->{end}, $row->{data}];
+            push @accum, [$seqname, $s, $e, $data];
             $counter++;
         }
         last if ($counter > $end);
@@ -322,7 +432,7 @@ Bio::GenomeMap - Data structure store and query genomically indexed data efficie
 
 =head1 VERSION
 
-version 0.01
+version 0.03
 
 =head1 SYNOPSIS
 

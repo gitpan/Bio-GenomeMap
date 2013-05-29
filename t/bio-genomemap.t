@@ -37,6 +37,19 @@ for my $gm ($in_memory, $in_file){
         "slurp_overlaps",
     );
 
+    {
+        my @res;
+        $gm->iter_overlaps('Chr1', 30000, 32000, sub{
+                my ($start, $end, $data) = @_;
+                push @res, [$start, $end, $data];
+            });
+        is_deeply(
+            $gm->slurp_overlaps('Chr1', 30000, 32000),
+            \@res,
+            "iter_overlaps",
+        );
+    }
+
     is_deeply(
         $gm->slurp_within('Chr1', 30000, 32000),
         [
@@ -58,9 +71,12 @@ for my $gm ($in_memory, $in_file){
     is_deeply(scalar(@{$gm->slurp_all}), 1293, 'slurp_all');
     # data col is just dummy numbers, so just search for a number
     is(scalar($gm->search(9, 0, 40)), 40, 'search returns expected number of results');
+
+    is( scalar($gm->search('9', 0, 10)), 10, "search with limit" );
+    is( scalar($gm->search('9', 0, 9999)), 119, "search with no limit" );
 }
 
-unlink $db if -e $db;
+# unlink $db if -e $db;
 
 sub load_into_memory{
     my $file = shift;
